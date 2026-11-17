@@ -11,7 +11,7 @@ than copy-pasting, and run each cell before moving on. Every section ends with a
 **Checkpoint** describing what you should see.
 
 **Time:** about 5 minutes of compute on a CPU (training is about 30 s/epoch; one
-morph run is about 20–30 s).
+morph run of 16,000 steps is under a minute).
 
 Contents:
 
@@ -124,12 +124,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
+from IPython.display import Image, display
 from tqdm import tqdm
 
 import predictive_coding as pc
 
 # Reproducibility: same random numbers every run
-SEED = 0
+SEED = 42
 torch.manual_seed(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
@@ -301,7 +303,8 @@ plt.show()
 
 **Checkpoint:** accuracy reaches about **0.85–0.88 after the first epoch**. After that
 it **fluctuates rather than climbing steadily**. In two runs with different seeds we
-saw anywhere between 0.83 and 0.92 over epochs 2–10. If you train the same network
+saw anywhere between 0.83 and 0.92 over epochs 2–10. With `SEED = 42` the five
+epochs give 0.848, 0.871, 0.867, 0.865 and 0.863. If you train the same network
 with notebook 5's `alpha_down = 1e-4`, you get about **0.97** after just two epochs.
 
 Five epochs is enough here: the generator is what we care about, and more epochs did
@@ -340,7 +343,7 @@ never inherits leftover state from training.
 
 ```python
 gen_model = BidirectionalPC(alpha_up, alpha_down).to(device)
-gen_model.load_state_dict(torch.load(ckpt_path))
+print(gen_model.load_state_dict(torch.load(ckpt_path)))
 
 # Freeze the weights: during generation only the latents and the image change.
 for p in gen_model.parameters():
@@ -353,8 +356,20 @@ for p in gen_model.parameters():
 
 ## 7. Generation as inference
 
-We write the inference loop **by hand** instead of using `PCTrainer`. It is only about
-fifteen lines, and every line corresponds to something in Section 1.
+We write the inference loop **by hand** instead of using `PCTrainer`. The loop itself
+is about fifteen lines, and every line corresponds to something in Section 1. Before it
+come two choices about **where inference starts**:
+
+- `image_init`: the image starts either as notebook 5's one-pass picture of the first
+  label (`"topdown"`) or as uniform noise (`"noise"`).
+- `latent_init`: the latents start either as top-down predictions from the label
+  (`"topdown"`) or as bottom-up predictions from the starting image (`"bottomup"`).
+
+With `"noise"` and `"bottomup"`, inference starts from a state that knows nothing about
+the label. Everything that turns the noise into a digit comes from the clamp, through
+inference. That's the setting we use in this section: generation from scratch. Starting
+from noise, a digit takes a few thousand steps to form, so phase A gets 6,000 steps
+before the swap.
 
 We generate all ten digits at once, as a batch of 10. Each row of the batch is
 independent, because the energy is a sum over rows. The **label schedule** is a list of
@@ -365,13 +380,16 @@ def one_hot(digits):
     return F.one_hot(torch.as_tensor(digits), num_classes=10).float().to(device)
 
 
-def generate(model, schedule, lr_x=0.02, init="topdown", record_every=40):
+def generate(model, schedule, lr_x=0.02, image_init="topdown", latent_init="topdown",
+             record_every=40):
     """
     Run PC inference with the label clamped and the image free.
 
-    schedule: list of (digits, n_steps), e.g. [([0..9], 300), ([1..9,0], 10000)]
-    init:     "topdown" -> start the image at the top-down prediction for the first label
-              "noise"   -> start the image as uniform noise
+    schedule:    list of (digits, n_steps), e.g. [([0..9], 300), ([1..9,0], 10000)]
+    image_init:  "topdown"  -> image starts as the top-down picture of the first label
+                 "noise"    -> image starts as uniform noise
+    latent_init: "topdown"  -> latents start as top-down predictions from the first label
+                 "bottomup" -> latents start as bottom-up predictions from the starting image
     Returns frames (list of (batch, 784) tensors), the clamped label of each frame,
     and the energy at every step.
     """
@@ -379,17 +397,30 @@ def generate(model, schedule, lr_x=0.02, init="topdown", record_every=40):
     y0 = one_hot(schedule[0][0])
     batch = y0.shape[0]
 
-    # (a) Initialise the latents x1, x0 with ONE top-down pass from the first label.
+    # (a) Where the IMAGE starts. It becomes a free variable: an nn.Parameter
+    #     that the optimiser can update.
+    if image_init == "topdown":
+        model.eval()                          # transparent PCLayers: a plain top-down pass
+        with torch.no_grad():
+            img0 = model.model_down(y0)       # notebook 5's picture of the first label
+        model.train()
+    elif image_init == "noise":
+        img0 = torch.rand(batch, 784, device=device)
+    else:
+        raise ValueError(f"unknown image_init: {image_init}")
+    img = nn.Parameter(img0.clone())
+
+    # (b) Where the LATENTS start: ONE forward pass with sampling switched on.
     #     set_is_sample_x(True) makes each PCLayer set _x := mu on the next forward call.
+    #     This comes after (a) because bottom-up latents are computed FROM the image.
     for p in model.pcs:
         p.set_is_sample_x(True)
-    u_hat = model.model_down(y0)
-
-    # (b) The image becomes a free variable: an nn.Parameter that the optimiser can update.
-    if init == "topdown":
-        img = nn.Parameter(u_hat.detach().clone())
+    if latent_init == "topdown":
+        model.model_down(y0)                  # x1, x0 := predictions from the label
+    elif latent_init == "bottomup":
+        model.model_up(img)                   # x0, x1 := predictions from the starting image
     else:
-        img = nn.Parameter(torch.rand(batch, 784, device=device))
+        raise ValueError(f"unknown latent_init: {latent_init}")
 
     # (c) Inference optimiser: plain gradient descent on x0, x1 and u. The weights are frozen.
     opt = optim.SGD([p._x for p in model.pcs] + [img], lr=lr_x)
@@ -420,15 +451,19 @@ Read it against the equations:
 - `E.backward()` computes $\partial E / \partial u$ and the corresponding gradients for $x_0$ and $x_1$.
 - `opt.step()` moves *only* the variables we gave to the optimiser.
 - Changing `y` between phases is the unclamp/clamp.
+- The image is set up **before** the latents, because `"bottomup"` latents are computed
+  from the image.
 
 Now run the morph: each digit $d$ turns into $d+1$ (and 9 turns into 0).
 
 ```python
+record_every = 40
 A = list(range(10))
 B = [(d + 1) % 10 for d in A]
-schedule = [(A, 300), (B, 10_000)]
+schedule = [(A, 6_000), (B, 10_000)]   # from noise, A needs ~6000 steps to form before the swap
 
-frames, frame_labels, energies = generate(gen_model, schedule, lr_x=0.02)
+frames, frame_labels, energies = generate(gen_model, schedule, lr_x=0.02, image_init="noise",
+                                          latent_init="bottomup", record_every=record_every)
 print(len(frames), "frames")
 
 plt.semilogy(energies)
@@ -437,11 +472,12 @@ plt.xlabel("inference step"); plt.ylabel("energy E"); plt.legend(); plt.grid(alp
 plt.show()
 ```
 
-**Checkpoint:** 258 frames: the initial image plus one every 40 of the 10,300 steps. In the energy plot (log scale):
+**Checkpoint:** 401 frames: the initial image plus one every 40 of the 16,000 steps. In the energy plot (log scale):
 
-- The energy starts low, because the top-down initialisation is already consistent with label A.
-- At step 300 there is a **jump**: the new clamp contradicts everything below it.
-- After the jump the energy **decreases smoothly** over the next ~10,000 steps.
+- The energy starts **high**, around 950: the noise image agrees with nothing. It falls
+  fast at first, then slowly, to about 0.6 by step 6,000.
+- At step 6,000 there is a **jump**, to about 15: the new clamp contradicts everything below it.
+- After the jump the energy **decreases smoothly** again, to about 0.2 at step 16,000.
 
 If the curve goes *up* before the swap, or oscillates, read the next section.
 
@@ -469,10 +505,10 @@ for name in ["model_up.0.weight", "model_up.3.weight", "model_up.6.weight",
     print(f"{name:22s} sigma_max^2 = {s * s:6.1f}")
 ```
 
-In a 5-epoch run, `model_down.3.weight` ($V_2$) had $\sigma^2 \approx 41$ and
-`model_up.6.weight` ($W_3$) had $\sigma^2 \approx 11$. So for $x_1$:
+In the 5-epoch run with `SEED = 42`, `model_down.3.weight` ($V_2$) had $\sigma^2 \approx 38.7$ and
+`model_up.6.weight` ($W_3$) had $\sigma^2 \approx 11.8$. So for $x_1$:
 
-$$\lambda_{\max} \lesssim 1 + 1 + 11 + 41 = 54 \quad\Rightarrow\quad \eta < 2/54 \approx 0.037$$
+$$\lambda_{\max} \lesssim 1 + 1 + 11.8 + 38.7 = 52.5 \quad\Rightarrow\quad \eta < 2/52.5 \approx 0.038$$
 
 The other layers give looser limits; check this yourself with the same reasoning for
 $x_0$ and $u$.
@@ -495,10 +531,12 @@ slow, so the morph is less complete after the same 10,000 steps.
 ## 9. Looking at the result
 
 A grid of snapshots: one column per digit, one row per moment in time. Frame times are
-spaced more densely right after the swap, where most of the change happens.
+spaced geometrically: densely at the start, where the noise turns into digits, and
+sparsely later. With the swap at step 6,000, only the last row comes after it; the GIF
+in Section 10 shows the morph itself.
 
 ```python
-def show_snapshots(frames, frame_labels, record_every=40, n_rows=8):
+def show_snapshots(frames, frame_labels, record_every, n_rows=8):
     idx = np.unique(np.geomspace(1, len(frames) - 1, n_rows - 1).astype(int))
     idx = [0] + list(idx)
     fig, axes = plt.subplots(len(idx), 10, figsize=(10, 1.1 * len(idx)))
@@ -512,26 +550,48 @@ def show_snapshots(frames, frame_labels, record_every=40, n_rows=8):
         axes[r, 0].set_ylabel(f"t={k * record_every}", fontsize=7)
     plt.tight_layout(); plt.show()
 
-show_snapshots(frames, frame_labels)
+show_snapshots(frames, frame_labels, record_every)
 ```
 
 Use the network's own classifier to check what it "sees" at the end of each phase:
 
 ```python
-gen_model.eval()  # transparent PCLayers -> feed-forward classifier
-with torch.no_grad():
-    before = gen_model.model_up(frames[schedule[0][1] // 40]).argmax(1).tolist()
-    after = gen_model.model_up(frames[-1]).argmax(1).tolist()
-gen_model.train()
+def classify(model, images):
+    """Feed-forward classification of a (batch, 784) tensor; returns a list of labels."""
+    model.eval()   # transparent PCLayers -> feed-forward classifier
+    with torch.no_grad():
+        pred = model.model_up(images).argmax(1).tolist()
+    model.train()  # back to latent mode
+    return pred
+
+before = classify(gen_model, frames[schedule[0][1] // record_every])  # last frame before the swap
+after = classify(gen_model, frames[-1])
 print("before swap:", before)
 print("after  swap:", after)
 ```
 
+To see *when* each image changes class, classify every 10th frame and flag the changes:
+
+```python
+# Print the predicted classes every 10 frames and flag the moments where any of them changes
+prev = None
+for i in range(0, len(frames), 10):
+    pred = classify(gen_model, frames[i])
+    flag = "  <- changed" if prev is not None and pred != prev else ""
+    print(f"step {i * record_every:6d}: {pred}{flag}")
+    prev = pred
+```
+
 **Checkpoint:**
 
-- In the grid, the first rows show clean digits 0–9. They then blur and reshape, and the last row shows mostly clean 1, 2, …, 9, 0.
-- Some digits keep a faint "ghost" of the old shape (0→1 and 6→7 are typically the slowest). Add steps to the second phase if you want them to finish.
+- In the grid, the first row is noise. By $t \approx 300$–$800$ it has become blurry blobs on a dark
+  background, and by $t \approx 6000$ there are recognisable digits 0–9. The last row shows
+  mostly clean 1, 2, …, 9, 0.
+- Some digits keep a faint "ghost" of the old shape; in our run 0→1 was the most visible.
+  Add steps to the second phase if you want them to finish.
 - The classifier prints `[0, 1, ..., 9]` before the swap and `[1, 2, ..., 9, 0]` after.
+- The change tracker shows the A digits settling by step 1,200, long before they look
+  clean. After the swap, the B labels take over between steps 6,800 and 7,600.
 
 ---
 
@@ -541,35 +601,37 @@ Matplotlib can write a GIF using Pillow, which is already installed. MP4 would n
 `ffmpeg`, which this environment doesn't have.
 
 ```python
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-def save_gif(frames, frame_labels, path, record_every=40, fps=20):
-    fig, axes = plt.subplots(1, 10, figsize=(10, 1.5))
-    ims = []
+def save_gif(frames, frame_labels, path, record_every, fps=20):
+    fig, axes = plt.subplots(1, 10, figsize=(10, 1.7))
+    ims, titles = [], []
     for c, ax in enumerate(axes):
         ims.append(ax.imshow(frames[0][c].view(28, 28).clamp(0, 1), cmap="gray", vmin=0, vmax=1))
+        titles.append(ax.set_title("", fontsize=9))
         ax.axis("off")
-    title = fig.suptitle("")
+    suptitle = fig.suptitle("")
 
     def update(k):
         for c in range(10):
             ims[c].set_data(frames[k][c].view(28, 28).clamp(0, 1))
-        title.set_text(f"step {k * record_every}   clamped label: {frame_labels[k]}")
+            titles[c].set_text(f"clamped: {frame_labels[k][c]}")
+        suptitle.set_text(f"step {k * record_every}")
         return ims
 
     FuncAnimation(fig, update, frames=len(frames)).save(path, writer=PillowWriter(fps=fps))
     plt.close(fig)
 
 gif_path = RUN_DIR / "morph_d_to_d+1.gif"
-save_gif(frames, frame_labels, gif_path)
+save_gif(frames, frame_labels, gif_path, record_every)
 print("saved", gif_path)
 ```
 
-**Checkpoint:** `RELAX/runs/mnist_bpc_generation/morph_d_to_d+1.gif` is about 3–4 MB,
-and about 13 s long at 20 fps. Open it in any image viewer or browser.
+**Checkpoint:** `RELAX/runs/mnist_bpc_generation/morph_d_to_d+1.gif` is about 16 MB,
+and about 20 s long at 20 fps. Each panel is titled with the label currently clamped on
+it. Open it in any image viewer or browser.
 
-To make the video longer or smoother, lower `record_every`, for example to 20. You get
-twice the frames and twice the file size.
+`record_every` sets the trade-off: 80 halves the frames and the file size, and 20 doubles
+both, making the video smoother. The early noise frames compress badly, which is why
+this GIF is large.
 
 ---
 
@@ -578,10 +640,12 @@ twice the frames and twice the file size.
 Each experiment is only a change to the arguments of `generate` or of training. Write
 down what you expect *before* you run it.
 
-1. **Generate from noise.** `generate(gen_model, [(A, 4000), (B, 100)], init="noise")`.
-   The latents still start from the top-down pass, but the image starts as noise. The
-   digits emerge in a few hundred steps, slightly noisier than with `init="topdown"`.
-   Why does the energy start in the thousands?
+1. **Where inference starts.** Rerun Section 7 with the other combinations of
+   `image_init` and `latent_init`. With `"topdown"` for both, the image starts as
+   notebook 5's picture of A and the latents already agree with it, so the energy
+   starts low. With `image_init="noise"` and `latent_init="topdown"`, the latents know
+   the label but the image doesn't. Why does the energy start in the thousands? Which
+   combination forms a clean A fastest?
 
 2. **The `alpha_down = 1e-4` network (notebook 5's setting).** Retrain with
    `alpha_down=1e-4` (2 epochs is enough to see the effect), save it under a different
@@ -592,9 +656,10 @@ down what you expect *before* you run it.
    "manifold" of digits. This is a strong argument for why the generative weight
    matters.
 
-3. **Chains.** `schedule = [(A, 300), (B, 5000), ([(d + 2) % 10 for d in A], 5000)]`.
+3. **Chains.** `schedule = [(A, 6000), (B, 5000), ([(d + 2) % 10 for d in A], 5000)]`.
    Does the second morph look like the first? Is the order of intermediate shapes
-   different?
+   different? The notebook's last cells (`make_single_digit_gif`) run a chain like
+   `[1, 8, 4]` on a single image and save it as a GIF next to its energy curve.
 
 4. **Swap back.** A → B → A. Does the image return to the original A, or to a different
    one? Inference finds *a* local minimum, not *the* minimum.

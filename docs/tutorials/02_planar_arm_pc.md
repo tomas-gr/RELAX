@@ -523,12 +523,13 @@ every line corresponds to something in Section 1. We reach several targets at on
 one batch. Each row of the batch is independent, because the energy is a sum over rows.
 
 ```python
-def reach(model, targets, q_start, steps=20_000, lr_q=0.05, lr_z=0.1, record_every=50):
+def reach(model, targets, q_start, steps=20_000, lr_q=0.05, lr_z=0.1, record_every=50, keep_latents=False):
     """
     Clamp target tip positions at the output and let the angles q (and the latents) settle.
 
     targets: list of (x, y), one per arm
     q_start: one (θ1, θ2) shared by all arms, or a list with one per arm
+    keep_latents: if True, z1 and z2 start where the previous call left them
     Returns a dict of NumPy arrays recorded every `record_every` steps.
     """
     model.train()                                   # PCLayers use their latents z
@@ -538,9 +539,11 @@ def reach(model, targets, q_start, steps=20_000, lr_q=0.05, lr_z=0.1, record_eve
     # (a) The angles are a free variable: an nn.Parameter that the optimiser can move.
     q = nn.Parameter(torch.tensor(q_start, dtype=torch.float32))
 
-    # (b) Initialise z1, z2 with one feed-forward pass from the starting angles (z := mu).
-    for layer in model.pcs:
-        layer.set_is_sample_x(True)
+    # (b) Initialise z1, z2 with one feed-forward pass from the starting angles (z := mu),
+    #     unless keep_latents: then they keep the values the previous call ended with.
+    if not keep_latents:
+        for layer in model.pcs:
+            layer.set_is_sample_x(True)
     model(q)
     z = [layer.get_x() for layer in model.pcs]
 
@@ -775,14 +778,18 @@ Each experiment is only a change to arguments or to one line. Write down what yo
    `q`. That is backprop, the thing PC avoids.)
 4. **Unreachable target.** Add `(2.5, 0.0)` to `targets`. What posture does the arm
    choose, and what is the relaxed error?
-5. **Moving target.** Reach a target for 10,000 steps, then change `target` and continue
-   *from the current state* for 10,000 more. You'll need to split `reach` into an
-   initialisation and a `for` loop you can call twice. This is the first step towards
-   control: the arm tracks a goal that changes over time.
+5. **Moving target.** Reach a target, then change it and continue *from the current
+   state*: pass the final angles as `q_start` and `keep_latents=True`, so that only the
+   clamp changes (as in the label swap of Tutorial 01). This is the first step towards
+   control: the arm tracks a goal that changes over time. The notebook's
+   `reach_sequence` and `save_sequence_gif` do this for a list of targets, with the
+   real error and the energy plotted side by side.
 6. **A seamless input.** Retrain with the input $(\cos\theta_1, \sin\theta_1, \cos\theta_2, \sin\theta_2)$:
    change `nn.Linear(2, hidden)` to `nn.Linear(4, hidden)` and transform the angles
    before feeding them in. Does the bright seam of Section 7 go away? For reaching,
-   keep `q` as the free variable and apply the transform inside `forward`.
+   keep `q` as the free variable and apply the transform inside `forward`. The notebook's
+   `ArmNetCS` does exactly this. With the same data and training, it reached test RMSE
+   0.018 (against 0.102), and all 12 starts of Section 11 reached the target.
 
 ---
 
